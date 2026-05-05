@@ -1,11 +1,13 @@
 ================================================================================
 PRD — fscdc (File System Change Data Capture)
+FID-FIRST ARCHITECTURE
 ================================================================================
 
-Version      : 1.0
+Version      : 2.0
 Status       : Draft
 Owner        : Platform Engineering
 Project Name : fscdc
+Architecture : fanotify + FAN_REPORT_FID
 Last Updated : 2026-05-06
 
 
@@ -15,68 +17,70 @@ Last Updated : 2026-05-06
 
 Goal
 ----
-fscdc는 Linux filesystem 상의 파일 변경 이벤트를 kernel-native 방식으로
-수집하고, append-only catalog로 기록하여 외부 프로세스가 polling 없이
-low-latency로 file sync 및 downstream processing을 수행할 수 있도록 하는
-CDC(Change Data Capture) 플랫폼이다.
+fscdc는 Linux filesystem의 file lifecycle event를 kernel-native 방식으로
+수집하고, append-only CDC catalog를 생성하여 외부 readonly consumer가
+filesystem polling 없이 low-latency file sync를 수행할 수 있도록 하는
+CDC platform이다.
+
+This version adopts:
+
+    fanotify + FID mode
+
+instead of:
+
+    fanotify + fd mode
+
+Rationale
+---------
+fd mode의 운영 리스크를 제거하기 위함.
+
+Eliminated Risk Classes:
+
+1. file descriptor leak
+2. /proc/self/fd path resolution overhead
+3. procfs dependency
+4. per-event file allocation overhead
+5. tail latency caused by path resolution
 
 Target Workload
 ---------------
-- 초당 수십~수백 개 파일 생성
-- directory tree의 동적 생성
-- 오래된 날짜 directory로 late-arriving file 유입
-- retention 정책에 따른 지속적 file deletion
-- 다수의 readonly external consumer
-
-Recommended Architecture
-------------------------
-fanotify + append-only SQLite WAL catalog
-
-Key Benefits
-------------
-- directory traversal 제거
-- polling 제거
-- dynamic directory 대응
-- readonly consumer scale-out
-- crash-safe
-- restart-safe
-
-Major Risks
------------
-- kernel event backlog
-- consumer lag
-- catalog growth
-- delete/read race
+- 100~1000 events/sec
+- 24x365 daemon
+- dynamic directory tree
+- late-arriving files
+- continuous deletion
+- multiple readonly consumers
 
 
 ================================================================================
 2. PROBLEM STATEMENT
 ================================================================================
 
-Current Directory Structure
----------------------------
+Filesystem Layout
+-----------------
 /file_svcXX/YYYYMMDD/LINE_ID/PROCESS_ID/FILENAME
 
-Example
--------
-/file_svc03/20260506/L01/P07/data_001.dat
+Examples
+--------
+/file_svc01/20260506/L01/P07/file_a.dat
+/file_svc03/20260312/L03/P12/file_b.dat
+/file_svc09/20260201/L09/P22/file_c.dat
 
 Characteristics
 ---------------
-- YYYYMMDD directory는 지속적으로 생성됨
-- LINE_ID는 runtime에 추가될 수 있음
-- PROCESS_ID는 runtime에 추가될 수 있음
-- 오래된 날짜 directory에도 file이 생성될 수 있음
+- date directories are created continuously
+- old date directories receive new files
+- line_id may change
+- process_id may change
+- retention jobs delete files continuously
 
-Problems with Polling
----------------------
-Traditional polling (find/stat/recursive traversal) causes:
+Polling-based traversal is not acceptable due to:
 
-- high inode scan cost
+- inode scan overhead
 - page cache pollution
-- duplicated scanning
+- duplicate scanning
 - delayed detection
-- high CPU and disk overhead
+- poor scalability
 
 
 ================================================================================
@@ -85,19 +89,21 @@ Traditional polling (find/stat/recursive traversal) causes:
 
 Functional Goals
 ----------------
-1. filesystem write-completion 감지
-2. filesystem delete 감지
-3. append-only event catalog 생성
-4. multiple readonly consumer 지원
-5. crash-safe recovery
+1. detect file write completion
+2. detect file deletion
+3. generate append-only CDC catalog
+4. support multiple readonly consumers
+5. support crash-safe restart
+6. eliminate directory traversal
 
 Non-functional Goals
 --------------------
 Event Latency     : < 100 ms
 Throughput        : >= 1000 events/sec
 Event Loss        : 0
-Recovery Time     : < 60 sec
-Consumers         : >= 10
+Recovery Time     : < 30 sec
+Daemon Uptime     : 365 days
+Consumer Count    : >= 10
 
 
 ================================================================================
@@ -106,18 +112,19 @@ Consumers         : >= 10
 
 In Scope
 --------
-- Linux local filesystem
+- Linux
+- local filesystem
 - ext4
 - xfs
-- single node deployment
-- multi-reader architecture
+- single node
+- multi-reader
 
 Out of Scope
 ------------
 - NFS
 - CephFS
-- distributed consensus
-- multi-node replication
+- distributed replication
+- multi-node consensus
 
 
 ================================================================================
@@ -131,8 +138,8 @@ Monitored Roots
 ...
 /file_svc10
 
-Path Format
------------
+Path Pattern
+------------
 /file_svcXX/YYYYMMDD/LINE_ID/PROCESS_ID/FILENAME
 
 Write Pattern
@@ -147,7 +154,7 @@ write()
 write()
 close()
 
-Rename pattern is NOT used.
+Rename workflow is NOT used.
 
 Delete Pattern
 --------------
@@ -155,27 +162,69 @@ Retention jobs may delete files at any time.
 
 
 ================================================================================
-6. HIGH LEVEL ARCHITECTURE
+6. WHY FID MODE
 ================================================================================
 
-                         filesystem
-                              |
-                              v
-                      fanotify watcher
-                              |
-                              v
-                        ring buffer
-                              |
-                              v
-                       catalog writer
-                              |
-                              v
-                     SQLite WAL catalog
-                              |
-          +-------------------+-------------------+
-          |                   |                   |
-          v                   v                   v
-      consumer A         consumer B         consumer N
+Traditional fd Mode Problems
+----------------------------
+
+Problem 1
+---------
+Every event generates:
+
+    meta->fd
+
+This requires:
+
+    close(fd)
+
+Risk:
+
+    fd leak
+    EMFILE
+
+Problem 2
+---------
+Path resolution requires:
+
+    /proc/self/fd
+
+Risk:
+
+    syscall overhead
+    procfs dependency
+    tail latency
+
+Problem 3
+---------
+Kernel allocates file objects.
+
+Risk:
+
+    burst overhead
+    kernel allocator pressure
+
+
+FID Mode Advantages
+-------------------
+
+Event provides:
+
+    file_handle
+
+instead of:
+
+    file descriptor
+
+Benefits:
+
+1. no fd leak
+2. no close()
+3. no procfs lookup
+4. lower kernel overhead
+5. lower tail latency
+6. delete event is more reliable
+7. watcher thread remains lightweight
 
 
 ================================================================================
@@ -184,74 +233,155 @@ Retention jobs may delete files at any time.
 
 Technology
 ----------
-Linux fanotify
+fanotify
+
+Initialization Mode
+-------------------
+FAN_REPORT_FID
+
+fanotify_init Flags
+-------------------
+
+Required:
+
+- FAN_CLASS_NOTIF
+- FAN_REPORT_FID
+
+Mark Strategy
+-------------
+Root-based mark.
+
+Marks:
+
+/file_svc01
+/file_svc02
+...
+/file_svc10
+
 
 Event Masks
 -----------
-FAN_CLOSE_WRITE
-FAN_DELETE
 
-Event Semantics
----------------
-FAN_CLOSE_WRITE
+Required:
 
-Meaning:
-File write has completed.
-File is safe for downstream consumption.
+- FAN_CLOSE_WRITE
+- FAN_DELETE
 
-FAN_DELETE
+Ignored:
 
-Meaning:
-File is logically deleted.
-Consumer must invalidate.
-
-Ignored Events
---------------
 - FAN_CREATE
-- FAN_OPEN
 - FAN_ACCESS
+- FAN_OPEN
 - directory events
 
 
+Event Semantics
+---------------
+
+FAN_CLOSE_WRITE
+
+Meaning:
+
+    file is committed
+    safe to consume
+
+
+FAN_DELETE
+
+Meaning:
+
+    file tombstone
+
+
 ================================================================================
-8. COMPONENT DESIGN
+8. HIGH LEVEL ARCHITECTURE
 ================================================================================
 
-8.1 WATCHER
+                          filesystem
+                               |
+                               v
+                    fanotify FID watcher
+                               |
+                               v
+                         ring buffer
+                               |
+                               v
+                       metadata resolver
+                               |
+                               v
+                         catalog writer
+                               |
+                               v
+                       SQLite WAL catalog
+                               |
+          +--------------------+--------------------+
+          |                    |                    |
+          v                    v                    v
+      consumer A          consumer B          consumer N
+
+
+Key Design Principle
+--------------------
+
+Watcher MUST NOT resolve path.
+
+Watcher only captures:
+
+- file_handle
+- event_type
+- timestamp
+
+Path resolution happens asynchronously.
+
+
+================================================================================
+9. COMPONENT DESIGN
+================================================================================
+
+9.1 WATCHER
 ================================================================================
 
 Responsibilities
 ----------------
+
 1. read fanotify events
-2. resolve fd -> absolute path
-3. collect file metadata
-4. enqueue event
+2. extract file_handle
+3. extract filesystem id
+4. generate internal event
+5. enqueue
 
-Forbidden Responsibilities
---------------------------
-Watcher MUST NOT perform:
+Watcher MUST NOT
+----------------
 
-- database write
-- network I/O
-- filesystem traversal
-- business processing
+- call open_by_handle_at()
+- resolve path
+- access procfs
+- write database
+- perform filesystem traversal
 
 Thread Model
 ------------
-Single thread.
+Single thread
 
 Output Event
 ------------
+
 event_type
-path
-inode
-file_size
-mtime_ns
+fsid
+file_handle
 event_ts_ns
 
 
+Performance Requirement
+-----------------------
+
+Watcher must process:
+
+    >= 5000 events/sec
+
+
 ================================================================================
-8.2 RING BUFFER
+9.2 RING BUFFER
 ================================================================================
 
 Type
@@ -268,51 +398,112 @@ Alert Threshold
 
 Overflow Policy
 ---------------
-Drop is NOT allowed.
-
-Backpressure must be observable.
+Drop is forbidden.
 
 
 ================================================================================
-8.3 CATALOG WRITER
+9.3 METADATA RESOLVER
 ================================================================================
 
 Responsibilities
 ----------------
+
 1. dequeue event
-2. batch insert
-3. commit transaction
+2. call open_by_handle_at()
+3. collect metadata
+4. resolve absolute path
+5. generate catalog event
+
+Thread Model
+------------
+Worker pool
+
+Default Workers
+---------------
+
+physical_cpu_cores
+
+
+Required Metadata
+-----------------
+
+path
+inode
+file_size
+mtime_ns
+
+
+Delete Event Policy
+-------------------
+
+If file no longer exists:
+
+tombstone event must still be generated.
+
+Cached metadata may be used.
+
+
+Metadata Cache
+--------------
+
+Required:
+
+handle -> path
+
+TTL:
+
+300 seconds
+
+
+Purpose:
+
+reduce repeated path resolution
+
+
+================================================================================
+9.4 CATALOG WRITER
+================================================================================
+
+Responsibilities
+----------------
+
+1. batch insert
+2. transaction commit
 
 Thread Model
 ------------
 Single thread
 
-Default Batch Size
-------------------
+Batch Size
+----------
 100
 
-Default Flush Interval
-----------------------
+Flush Interval
+--------------
 100 ms
 
 
 ================================================================================
-9. CATALOG DESIGN
+10. CATALOG DESIGN
 ================================================================================
 
 Storage Engine
 --------------
 SQLite
 
-Required Pragmas
-----------------
+Required Settings
+-----------------
+
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA wal_autocheckpoint=10000;
 
+
 Schema
 ------
+
 CREATE TABLE file_events (
+
     seq_id INTEGER PRIMARY KEY AUTOINCREMENT,
 
     event_type INTEGER NOT NULL,
@@ -326,151 +517,177 @@ CREATE TABLE file_events (
     mtime_ns INTEGER,
 
     event_ts_ns INTEGER NOT NULL
+
 );
+
 
 Event Types
 -----------
+
 1 = UPSERT
 2 = DELETE
 
+
 Meaning
 -------
-UPSERT means:
-"The file exists and is safe to read."
 
-DELETE means:
-"The file has been deleted."
+UPSERT:
+
+    file exists
+    safe to read
+
+
+DELETE:
+
+    file deleted
+    invalidate cache
 
 
 ================================================================================
-10. CONSUMER MODEL
+11. CONSUMER MODEL
 ================================================================================
 
 Consumption Query
 -----------------
+
 SELECT *
 FROM file_events
 WHERE seq_id > ?
 ORDER BY seq_id;
 
-Offset Model
-------------
-Each consumer independently maintains:
 
-last_seq_id
+Consumer Offset
+---------------
+
+Each consumer maintains:
+
+    last_seq_id
+
 
 Delivery Guarantee
 ------------------
+
 At-least-once
+
 
 Ordering Guarantee
 ------------------
+
 Per-node total ordering
 
 
+Consumer Requirements
+---------------------
+
+Consumer MUST handle:
+
+- duplicate events
+- delayed delete
+- ENOENT
+
+
 ================================================================================
-11. CONSISTENCY MODEL
+12. CONSISTENCY MODEL
 ================================================================================
 
 Source of Truth
 ---------------
+
 Filesystem is authoritative.
 
-Catalog is only an event journal.
+Catalog is event journal only.
 
-Race Scenario
--------------
+
+Delete Race
+-----------
+
 Timeline:
 
-1. UPSERT event committed
-2. DELETE event committed
-3. consumer reads late
+1. UPSERT committed
+2. file deleted
+3. DELETE committed
+4. consumer reads later
 
-Result:
+Expected Behavior:
 
-Consumer may receive ENOENT.
+Consumer may see:
+
+    ENOENT
 
 This is valid.
 
-Consumer Requirements
----------------------
-Consumers MUST handle:
-
-- ENOENT
-- duplicate events
-- delayed delete events
-
 
 ================================================================================
-12. RECOVERY
+13. RECOVERY
 ================================================================================
 
 Process Restart
 ---------------
-Startup sequence:
 
-1. open SQLite catalog
-2. validate WAL
-3. start fanotify watcher
-4. start writer thread
-5. start metrics exporter
+Startup Sequence:
+
+1. open mount fds
+2. initialize fanotify
+3. validate SQLite WAL
+4. start watcher
+5. start resolver pool
+6. start writer
 
 Filesystem scan is NOT required.
 
+
 Crash Recovery
 --------------
+
 SQLite WAL guarantees:
 
-- committed transactions survive
-- partial transactions are discarded
+- committed events preserved
+- partial transactions discarded
 
 
 ================================================================================
-13. RETENTION
+14. RETENTION
 ================================================================================
 
-Cleanup Policy
---------------
+Cleanup Condition
+-----------------
+
 Events may be deleted only when:
 
-all consumers have advanced beyond the target sequence.
+all consumers have advanced.
 
 Cleanup Query
 -------------
+
 DELETE FROM file_events
 WHERE seq_id < ?;
 
+
 Default Retention
 -----------------
+
 7 days
 
 
 ================================================================================
-14. OBSERVABILITY
+15. OBSERVABILITY
 ================================================================================
 
 Required Metrics
 ----------------
 
 events_per_sec
-Meaning:
-Incoming filesystem event rate
 
 queue_usage_percent
-Meaning:
-Ring buffer occupancy
 
 queue_lag_ms
-Meaning:
-Current event processing lag
+
+resolver_latency_ms
 
 sqlite_commit_latency_ms
-Meaning:
-Catalog write latency
 
 consumer_lag
-Meaning:
-latest_seq - consumer_seq
+
 
 Alert Rules
 -----------
@@ -479,91 +696,121 @@ queue_usage_percent > 80
 
 queue_lag_ms > 1000
 
+resolver_latency_ms > 100
+
 consumer_lag > 100000
 
 
 ================================================================================
-15. PERFORMANCE TARGETS
+16. PERFORMANCE TARGETS
 ================================================================================
 
 Normal Load
 -----------
+
 100~500 events/sec
+
 
 Burst Load
 ----------
+
 1000 events/sec
+
+
+Stress Goal
+-----------
+
+5000 events/sec
+
 
 Resource Targets
 ----------------
-Watcher CPU          < 1 core
-Writer CPU           < 1 core
-Memory               < 512 MB
-Disk Write           < 20 MB/sec
 
-Data Loss
----------
+Watcher CPU          < 1 core
+Resolver CPU         < 2 cores
+Writer CPU           < 1 core
+Memory               < 1 GB
+
+
+Event Loss
+----------
+
 0
 
 
 ================================================================================
-16. FAILURE SCENARIOS
+17. FAILURE SCENARIOS
 ================================================================================
 
 Scenario 1
 ----------
-Watcher blocked.
+
+Resolver blocked.
 
 Detection:
-queue lag increases
+
+resolver latency spike
 
 Action:
-restart process
+
+scale resolver workers
 
 
 Scenario 2
 ----------
-Consumer is too slow.
+
+Consumer slow.
 
 Detection:
-consumer lag increases
+
+consumer lag
 
 Action:
-scale consumer instances
+
+scale consumers
 
 
 Scenario 3
 ----------
+
 Disk full.
 
 Detection:
-catalog write failure
+
+SQLite write failure
 
 Action:
+
 emergency retention cleanup
 
 
 Scenario 4
 ----------
-SQLite lock contention.
+
+Handle resolution failure.
 
 Detection:
-commit latency spike
+
+open_by_handle_at failure
 
 Action:
-validate reader behavior
+
+retry + cache fallback
 
 
 ================================================================================
-17. DEPLOYMENT
+18. DEPLOYMENT
 ================================================================================
 
 Binary Name
 -----------
+
 fscdc
+
 
 Example
 -------
+
 fscdc \
   --root /file_svc01 \
   --root /file_svc02 \
@@ -573,22 +820,27 @@ fscdc \
 
 Process Model
 -------------
+
 1 watcher thread
+N resolver threads
 1 writer thread
-N optional metric threads
+1 metrics exporter
 
 
 ================================================================================
-18. SUCCESS CRITERIA
+19. SUCCESS CRITERIA
 ================================================================================
 
-The project is considered successful when:
+Project is successful when:
 
 1. filesystem polling is fully eliminated
-2. no event loss under 1000 events/sec
-3. all external consumers use catalog only
-4. restart is fully automatic
-5. operational metrics are fully observable
+2. fd leak class is fully eliminated
+3. no procfs dependency exists
+4. no event loss under 1000 events/sec
+5. restart is fully automatic
+6. external consumers use catalog only
+7. daemon operates continuously for 365 days
+
 
 ================================================================================
 END OF DOCUMENT
