@@ -1,0 +1,595 @@
+================================================================================
+PRD — fscdc (File System Change Data Capture)
+================================================================================
+
+Version      : 1.0
+Status       : Draft
+Owner        : Platform Engineering
+Project Name : fscdc
+Last Updated : 2026-05-06
+
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+Goal
+----
+fscdc는 Linux filesystem 상의 파일 변경 이벤트를 kernel-native 방식으로
+수집하고, append-only catalog로 기록하여 외부 프로세스가 polling 없이
+low-latency로 file sync 및 downstream processing을 수행할 수 있도록 하는
+CDC(Change Data Capture) 플랫폼이다.
+
+Target Workload
+---------------
+- 초당 수십~수백 개 파일 생성
+- directory tree의 동적 생성
+- 오래된 날짜 directory로 late-arriving file 유입
+- retention 정책에 따른 지속적 file deletion
+- 다수의 readonly external consumer
+
+Recommended Architecture
+------------------------
+fanotify + append-only SQLite WAL catalog
+
+Key Benefits
+------------
+- directory traversal 제거
+- polling 제거
+- dynamic directory 대응
+- readonly consumer scale-out
+- crash-safe
+- restart-safe
+
+Major Risks
+-----------
+- kernel event backlog
+- consumer lag
+- catalog growth
+- delete/read race
+
+
+================================================================================
+2. PROBLEM STATEMENT
+================================================================================
+
+Current Directory Structure
+---------------------------
+/file_svcXX/YYYYMMDD/LINE_ID/PROCESS_ID/FILENAME
+
+Example
+-------
+/file_svc03/20260506/L01/P07/data_001.dat
+
+Characteristics
+---------------
+- YYYYMMDD directory는 지속적으로 생성됨
+- LINE_ID는 runtime에 추가될 수 있음
+- PROCESS_ID는 runtime에 추가될 수 있음
+- 오래된 날짜 directory에도 file이 생성될 수 있음
+
+Problems with Polling
+---------------------
+Traditional polling (find/stat/recursive traversal) causes:
+
+- high inode scan cost
+- page cache pollution
+- duplicated scanning
+- delayed detection
+- high CPU and disk overhead
+
+
+================================================================================
+3. PRODUCT GOALS
+================================================================================
+
+Functional Goals
+----------------
+1. filesystem write-completion 감지
+2. filesystem delete 감지
+3. append-only event catalog 생성
+4. multiple readonly consumer 지원
+5. crash-safe recovery
+
+Non-functional Goals
+--------------------
+Event Latency     : < 100 ms
+Throughput        : >= 1000 events/sec
+Event Loss        : 0
+Recovery Time     : < 60 sec
+Consumers         : >= 10
+
+
+================================================================================
+4. SCOPE
+================================================================================
+
+In Scope
+--------
+- Linux local filesystem
+- ext4
+- xfs
+- single node deployment
+- multi-reader architecture
+
+Out of Scope
+------------
+- NFS
+- CephFS
+- distributed consensus
+- multi-node replication
+
+
+================================================================================
+5. FILESYSTEM MODEL
+================================================================================
+
+Monitored Roots
+---------------
+/file_svc01
+/file_svc02
+...
+/file_svc10
+
+Path Format
+-----------
+/file_svcXX/YYYYMMDD/LINE_ID/PROCESS_ID/FILENAME
+
+Write Pattern
+-------------
+Only direct write is supported.
+
+Sequence:
+
+open()
+write()
+write()
+write()
+close()
+
+Rename pattern is NOT used.
+
+Delete Pattern
+--------------
+Retention jobs may delete files at any time.
+
+
+================================================================================
+6. HIGH LEVEL ARCHITECTURE
+================================================================================
+
+                         filesystem
+                              |
+                              v
+                      fanotify watcher
+                              |
+                              v
+                        ring buffer
+                              |
+                              v
+                       catalog writer
+                              |
+                              v
+                     SQLite WAL catalog
+                              |
+          +-------------------+-------------------+
+          |                   |                   |
+          v                   v                   v
+      consumer A         consumer B         consumer N
+
+
+================================================================================
+7. EVENT COLLECTION
+================================================================================
+
+Technology
+----------
+Linux fanotify
+
+Event Masks
+-----------
+FAN_CLOSE_WRITE
+FAN_DELETE
+
+Event Semantics
+---------------
+FAN_CLOSE_WRITE
+
+Meaning:
+File write has completed.
+File is safe for downstream consumption.
+
+FAN_DELETE
+
+Meaning:
+File is logically deleted.
+Consumer must invalidate.
+
+Ignored Events
+--------------
+- FAN_CREATE
+- FAN_OPEN
+- FAN_ACCESS
+- directory events
+
+
+================================================================================
+8. COMPONENT DESIGN
+================================================================================
+
+8.1 WATCHER
+================================================================================
+
+Responsibilities
+----------------
+1. read fanotify events
+2. resolve fd -> absolute path
+3. collect file metadata
+4. enqueue event
+
+Forbidden Responsibilities
+--------------------------
+Watcher MUST NOT perform:
+
+- database write
+- network I/O
+- filesystem traversal
+- business processing
+
+Thread Model
+------------
+Single thread.
+
+Output Event
+------------
+event_type
+path
+inode
+file_size
+mtime_ns
+event_ts_ns
+
+
+================================================================================
+8.2 RING BUFFER
+================================================================================
+
+Type
+----
+Lock-free MPSC queue
+
+Capacity
+--------
+65536 events
+
+Alert Threshold
+---------------
+80%
+
+Overflow Policy
+---------------
+Drop is NOT allowed.
+
+Backpressure must be observable.
+
+
+================================================================================
+8.3 CATALOG WRITER
+================================================================================
+
+Responsibilities
+----------------
+1. dequeue event
+2. batch insert
+3. commit transaction
+
+Thread Model
+------------
+Single thread
+
+Default Batch Size
+------------------
+100
+
+Default Flush Interval
+----------------------
+100 ms
+
+
+================================================================================
+9. CATALOG DESIGN
+================================================================================
+
+Storage Engine
+--------------
+SQLite
+
+Required Pragmas
+----------------
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA wal_autocheckpoint=10000;
+
+Schema
+------
+CREATE TABLE file_events (
+    seq_id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    event_type INTEGER NOT NULL,
+
+    path TEXT NOT NULL,
+
+    inode INTEGER NOT NULL,
+
+    file_size INTEGER,
+
+    mtime_ns INTEGER,
+
+    event_ts_ns INTEGER NOT NULL
+);
+
+Event Types
+-----------
+1 = UPSERT
+2 = DELETE
+
+Meaning
+-------
+UPSERT means:
+"The file exists and is safe to read."
+
+DELETE means:
+"The file has been deleted."
+
+
+================================================================================
+10. CONSUMER MODEL
+================================================================================
+
+Consumption Query
+-----------------
+SELECT *
+FROM file_events
+WHERE seq_id > ?
+ORDER BY seq_id;
+
+Offset Model
+------------
+Each consumer independently maintains:
+
+last_seq_id
+
+Delivery Guarantee
+------------------
+At-least-once
+
+Ordering Guarantee
+------------------
+Per-node total ordering
+
+
+================================================================================
+11. CONSISTENCY MODEL
+================================================================================
+
+Source of Truth
+---------------
+Filesystem is authoritative.
+
+Catalog is only an event journal.
+
+Race Scenario
+-------------
+Timeline:
+
+1. UPSERT event committed
+2. DELETE event committed
+3. consumer reads late
+
+Result:
+
+Consumer may receive ENOENT.
+
+This is valid.
+
+Consumer Requirements
+---------------------
+Consumers MUST handle:
+
+- ENOENT
+- duplicate events
+- delayed delete events
+
+
+================================================================================
+12. RECOVERY
+================================================================================
+
+Process Restart
+---------------
+Startup sequence:
+
+1. open SQLite catalog
+2. validate WAL
+3. start fanotify watcher
+4. start writer thread
+5. start metrics exporter
+
+Filesystem scan is NOT required.
+
+Crash Recovery
+--------------
+SQLite WAL guarantees:
+
+- committed transactions survive
+- partial transactions are discarded
+
+
+================================================================================
+13. RETENTION
+================================================================================
+
+Cleanup Policy
+--------------
+Events may be deleted only when:
+
+all consumers have advanced beyond the target sequence.
+
+Cleanup Query
+-------------
+DELETE FROM file_events
+WHERE seq_id < ?;
+
+Default Retention
+-----------------
+7 days
+
+
+================================================================================
+14. OBSERVABILITY
+================================================================================
+
+Required Metrics
+----------------
+
+events_per_sec
+Meaning:
+Incoming filesystem event rate
+
+queue_usage_percent
+Meaning:
+Ring buffer occupancy
+
+queue_lag_ms
+Meaning:
+Current event processing lag
+
+sqlite_commit_latency_ms
+Meaning:
+Catalog write latency
+
+consumer_lag
+Meaning:
+latest_seq - consumer_seq
+
+Alert Rules
+-----------
+
+queue_usage_percent > 80
+
+queue_lag_ms > 1000
+
+consumer_lag > 100000
+
+
+================================================================================
+15. PERFORMANCE TARGETS
+================================================================================
+
+Normal Load
+-----------
+100~500 events/sec
+
+Burst Load
+----------
+1000 events/sec
+
+Resource Targets
+----------------
+Watcher CPU          < 1 core
+Writer CPU           < 1 core
+Memory               < 512 MB
+Disk Write           < 20 MB/sec
+
+Data Loss
+---------
+0
+
+
+================================================================================
+16. FAILURE SCENARIOS
+================================================================================
+
+Scenario 1
+----------
+Watcher blocked.
+
+Detection:
+queue lag increases
+
+Action:
+restart process
+
+
+Scenario 2
+----------
+Consumer is too slow.
+
+Detection:
+consumer lag increases
+
+Action:
+scale consumer instances
+
+
+Scenario 3
+----------
+Disk full.
+
+Detection:
+catalog write failure
+
+Action:
+emergency retention cleanup
+
+
+Scenario 4
+----------
+SQLite lock contention.
+
+Detection:
+commit latency spike
+
+Action:
+validate reader behavior
+
+
+================================================================================
+17. DEPLOYMENT
+================================================================================
+
+Binary Name
+-----------
+fscdc
+
+Example
+-------
+fscdc \
+  --root /file_svc01 \
+  --root /file_svc02 \
+  --root /file_svc03 \
+  --db /var/lib/fscdc/catalog.db
+
+
+Process Model
+-------------
+1 watcher thread
+1 writer thread
+N optional metric threads
+
+
+================================================================================
+18. SUCCESS CRITERIA
+================================================================================
+
+The project is considered successful when:
+
+1. filesystem polling is fully eliminated
+2. no event loss under 1000 events/sec
+3. all external consumers use catalog only
+4. restart is fully automatic
+5. operational metrics are fully observable
+
+================================================================================
+END OF DOCUMENT
+================================================================================
